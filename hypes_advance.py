@@ -7,14 +7,18 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import scipy.stats as stats
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.svm import SVC, SVR
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, 
                            confusion_matrix, classification_report, roc_curve, auc,
-                           mean_absolute_error, mean_squared_error, r2_score)
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+                           mean_absolute_error, mean_squared_error, r2_score,
+                           mean_absolute_percentage_error)
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LinearRegression
+from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+from sklearn.inspection import permutation_importance
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import adfuller
 import warnings
@@ -22,6 +26,7 @@ import requests
 import io
 from urllib.parse import urlparse
 import openpyxl
+import joblib
 warnings.filterwarnings('ignore')
 
 # Import additional statistical packages
@@ -30,14 +35,12 @@ try:
     PINGOUIN_AVAILABLE = True
 except ImportError:
     PINGOUIN_AVAILABLE = False
-    st.warning("Pingouin not available. Install with: pip install pingouin")
 
 try:
     from prophet import Prophet
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
-    st.warning("Prophet not available. Install with: pip install prophet")
 
 # Page Configuration
 st.set_page_config(
@@ -91,6 +94,13 @@ st.markdown("""
         border-left: 5px solid #17a2b8;
         margin: 1rem 0;
     }
+    .model-box {
+        background-color: #f8f0ff;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 5px solid #8e44ad;
+        margin: 1rem 0;
+    }
     .metric-card {
         background: white;
         padding: 1rem;
@@ -129,6 +139,12 @@ st.markdown("""
         color: #27ae60;
         font-weight: bold;
     }
+    .feature-importance {
+        background-color: #fff3cd;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 0.5rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -142,13 +158,11 @@ class DataLoader:
             response = requests.get(url)
             response.raise_for_status()
             
-            # Check file type from URL
             if url.endswith('.csv'):
                 return pd.read_csv(io.StringIO(response.text))
             elif url.endswith(('.xlsx', '.xls')):
                 return pd.read_excel(io.BytesIO(response.content))
             else:
-                # Try to detect file type
                 try:
                     return pd.read_csv(io.StringIO(response.text))
                 except:
@@ -176,7 +190,6 @@ class DataLoader:
         np.random.seed(42)
         n_samples = 200
         
-        # Create sample time series with trend, seasonality, and noise
         dates = pd.date_range(start='2020-01-01', periods=n_samples, freq='D')
         trend = np.linspace(100, 150, n_samples)
         seasonal = 10 * np.sin(2 * np.pi * np.arange(n_samples) / 30)
@@ -193,10 +206,54 @@ class DataLoader:
             'customer_rating': np.random.uniform(1, 5, n_samples),
             'advertising_budget': np.random.normal(5000, 1500, n_samples),
             'group': np.random.choice(['Control', 'Treatment'], n_samples),
-            'satisfaction_score': np.random.normal(4.2, 0.8, n_samples)
+            'satisfaction_score': np.random.normal(4.2, 0.8, n_samples),
+            'churn': np.random.choice([0, 1], n_samples, p=[0.7, 0.3]),
+            'customer_lifetime_value': np.random.exponential(5000, n_samples)
         }
         
         return pd.DataFrame(sample_data)
+
+class DataPreprocessor:
+    """Handle data preprocessing and type conversions"""
+    
+    @staticmethod
+    def preprocess_data(df, target_variable=None):
+        """Preprocess data for analysis"""
+        df_processed = df.copy()
+        
+        # Auto-detect and convert date columns
+        for col in df_processed.columns:
+            if 'date' in col.lower() or 'time' in col.lower():
+                try:
+                    df_processed[col] = pd.to_datetime(df_processed[col])
+                except:
+                    pass
+        
+        # Convert string categoricals to numerical if needed for target
+        if target_variable and df_processed[target_variable].dtype == 'object':
+            le = LabelEncoder()
+            df_processed[target_variable] = le.fit_transform(df_processed[target_variable])
+            st.info(f"Converted '{target_variable}' from categorical to numerical for analysis")
+        
+        return df_processed
+    
+    @staticmethod
+    def prepare_features(df, target_variable, problem_type):
+        """Prepare features for modeling"""
+        X = df.drop(columns=[target_variable])
+        y = df[target_variable]
+        
+        # Handle categorical variables
+        categorical_cols = X.select_dtypes(include=['object']).columns
+        numerical_cols = X.select_dtypes(include=[np.number]).columns
+        
+        if len(categorical_cols) > 0:
+            X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+        
+        # Remove any remaining non-numeric columns
+        X = X.select_dtypes(include=[np.number])
+        
+        return X, y
 
 class AdvancedStatisticalAnalysis:
     def __init__(self, df):
@@ -303,14 +360,11 @@ class AdvancedStatisticalAnalysis:
         
         st.write("**Outlier Detection Summary:**")
         
-        # Z-score and IQR methods
         outlier_results = {}
         for col in self.numerical_cols:
-            # Z-score method
             z_scores = np.abs(stats.zscore(self.df[col].dropna()))
             z_outliers = (z_scores > 3).sum()
             
-            # IQR method
             Q1 = self.df[col].quantile(0.25)
             Q3 = self.df[col].quantile(0.75)
             IQR = Q3 - Q1
@@ -336,14 +390,12 @@ class AdvancedStatisticalAnalysis:
         if selected_var:
             col1, col2 = st.columns(2)
             with col1:
-                # Box plot
                 fig, ax = plt.subplots(figsize=(10, 6))
                 sns.boxplot(y=self.df[selected_var], ax=ax)
                 ax.set_title(f'Box Plot - {selected_var}')
                 st.pyplot(fig)
             
             with col2:
-                # Histogram with outlier boundaries
                 fig, ax = plt.subplots(figsize=(10, 6))
                 Q1 = self.df[selected_var].quantile(0.25)
                 Q3 = self.df[selected_var].quantile(0.75)
@@ -379,7 +431,6 @@ class AdvancedStatisticalAnalysis:
             with col:
                 st.metric(title, f"{value:.1f}%")
         
-        # Quality score gauge
         overall_quality = np.mean(list(quality_metrics.values()))
         st.write(f"**Overall Data Quality Score: {overall_quality:.1f}%**")
         
@@ -391,27 +442,22 @@ class AdvancedStatisticalAnalysis:
             st.error("❌ Poor data quality - significant cleaning needed")
     
     def _calculate_consistency_score(self):
-        """Calculate data consistency score"""
-        # Check for consistent data types and formats
         score = 100
         for col in self.df.columns:
             if self.df[col].dtype == 'object':
-                # Check for mixed formats in string columns
                 unique_count = self.df[col].nunique()
                 if unique_count > len(self.df) * 0.5:
                     score -= 5
         return max(score, 0)
     
     def _calculate_validity_score(self):
-        """Calculate data validity score"""
         score = 100
         for col in self.numerical_cols:
-            # Check for impossible values
             if (self.df[col] < 0).any() and col.lower() in ['age', 'price', 'salary']:
                 score -= 10
         return max(score, 0)
 
-    # Phase 2: Exploratory Data Analysis with Pattern & Trend Analysis
+    # Phase 2: Exploratory Data Analysis
     def exploratory_analysis_phase(self):
         st.markdown('<div class="phase-header"><h2>🔍 Phase 2: Exploratory Data Analysis</h2></div>', 
                    unsafe_allow_html=True)
@@ -420,12 +466,12 @@ class AdvancedStatisticalAnalysis:
         st.subheader("2.1 Advanced Pattern & Trend Analysis")
         self._pattern_trend_analysis()
         
-        # Time Series Analysis (if date column exists)
+        # Time Series Analysis
         if self._has_date_column():
             st.subheader("2.2 Time Series Analysis")
             self._time_series_analysis()
         
-        # Correlation with Confidence Intervals
+        # Correlation Analysis
         st.subheader("2.3 Correlation Analysis with Confidence Intervals")
         self._correlation_with_ci()
         
@@ -437,49 +483,35 @@ class AdvancedStatisticalAnalysis:
         st.subheader("2.5 Multivariate Analysis")
         self._multivariate_analysis()
         
-        # Advanced Statistical Tests (Pingouin)
+        # Advanced Statistical Tests
         if PINGOUIN_AVAILABLE:
             st.subheader("2.6 Advanced Statistical Tests")
             self._advanced_statistical_tests()
 
     def _pattern_trend_analysis(self):
-        """Comprehensive pattern and trend analysis with confidence intervals"""
-        
         if not self.numerical_cols:
             st.info("No numerical columns for trend analysis")
             return
         
-        # Select variables for analysis
         col1, col2 = st.columns(2)
         with col1:
             trend_var = st.selectbox("Select variable for trend analysis:", self.numerical_cols)
         with col2:
             confidence_level = st.slider("Confidence Level", 0.80, 0.99, 0.95)
         
-        # Trend detection with confidence intervals
         st.subheader(f"Trend Analysis for {trend_var}")
         
-        # Calculate rolling statistics with confidence intervals
         if len(self.df) > 10:
             self._rolling_analysis_with_ci(trend_var, confidence_level)
         
-        # Linear trend analysis with confidence intervals
         self._linear_trend_analysis(trend_var, confidence_level)
-        
-        # Seasonal pattern detection
         self._seasonal_analysis(trend_var)
-        
-        # Change point detection
         self._change_point_analysis(trend_var)
         
-        # Prophet forecasting (if date column exists)
         if self._has_date_column() and PROPHET_AVAILABLE:
             self._prophet_forecasting(trend_var)
 
     def _rolling_analysis_with_ci(self, variable, confidence_level):
-        """Rolling mean and standard deviation with confidence intervals"""
-        
-        # Create index if no date column
         if not self._has_date_column():
             self.df['index'] = range(len(self.df))
             x_var = 'index'
@@ -487,20 +519,16 @@ class AdvancedStatisticalAnalysis:
             date_col = self.date_cols[0]
             x_var = date_col
         
-        # Calculate rolling statistics
         window_size = min(30, len(self.df) // 10)
         rolling_mean = self.df[variable].rolling(window=window_size, center=True).mean()
         rolling_std = self.df[variable].rolling(window=window_size, center=True).std()
         
-        # Calculate confidence intervals
         z_value = stats.norm.ppf(1 - (1 - confidence_level) / 2)
         ci_upper = rolling_mean + z_value * rolling_std / np.sqrt(window_size)
         ci_lower = rolling_mean - z_value * rolling_std / np.sqrt(window_size)
         
-        # Create plot
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
         
-        # Rolling mean with confidence interval
         ax1.plot(self.df[x_var], self.df[variable], alpha=0.3, label='Actual Data', color='lightblue')
         ax1.plot(self.df[x_var], rolling_mean, label=f'Rolling Mean (window={window_size})', color='red', linewidth=2)
         ax1.fill_between(self.df[x_var], ci_lower, ci_upper, alpha=0.2, 
@@ -509,7 +537,6 @@ class AdvancedStatisticalAnalysis:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # Rolling standard deviation
         ax2.plot(self.df[x_var], rolling_std, color='green', linewidth=2)
         ax2.set_title(f'Rolling Standard Deviation - {variable}')
         ax2.set_ylabel('Standard Deviation')
@@ -518,13 +545,11 @@ class AdvancedStatisticalAnalysis:
         plt.tight_layout()
         st.pyplot(fig)
         
-        # Calculate metrics for interpretation
         ci_width_mean = ((ci_upper - ci_lower).mean() / rolling_mean.mean() * 100) if rolling_mean.mean() != 0 else 0
         volatility_status = 'Stable' if rolling_std.mean() < rolling_mean.mean() * 0.1 else 'Volatile'
         trend_direction = self._get_trend_direction(rolling_mean)
         volatility_pattern = self._get_volatility_pattern(rolling_std)
         
-        # Trend interpretation
         st.markdown(f"""
         <div class="trend-box">
         <h4>📈 Rolling Analysis Interpretation - {variable}:</h4>
@@ -539,32 +564,24 @@ class AdvancedStatisticalAnalysis:
         """, unsafe_allow_html=True)
 
     def _linear_trend_analysis(self, variable, confidence_level):
-        """Linear regression trend analysis with confidence intervals"""
-        
-        # Prepare data
         x = np.arange(len(self.df)).reshape(-1, 1)
         y = self.df[variable].values
         
-        # Linear regression
         model = LinearRegression()
         model.fit(x, y)
         y_pred = model.predict(x)
         
-        # Calculate confidence intervals
         residuals = y - y_pred
         residual_std = np.std(residuals)
         n = len(x)
         x_mean = np.mean(x)
         
-        # Standard error for confidence interval
         se = residual_std * np.sqrt(1/n + (x - x_mean)**2 / np.sum((x - x_mean)**2))
         t_value = stats.t.ppf(1 - (1 - confidence_level) / 2, n - 2)
         ci = t_value * se
         
-        # Create plot
         fig, ax = plt.subplots(figsize=(12, 6))
         
-        # Plot data and regression line
         ax.scatter(x, y, alpha=0.6, label='Actual Data', color='lightblue')
         ax.plot(x, y_pred, color='red', linewidth=2, label='Linear Trend')
         ax.fill_between(x.flatten(), y_pred - ci.flatten(), y_pred + ci.flatten(), 
@@ -578,7 +595,6 @@ class AdvancedStatisticalAnalysis:
         
         st.pyplot(fig)
         
-        # Statistical summary
         slope = model.coef_[0]
         r_squared = model.score(x, y)
         
@@ -595,14 +611,11 @@ class AdvancedStatisticalAnalysis:
             st.metric("Direction", direction)
 
     def _seasonal_analysis(self, variable):
-        """Seasonal pattern detection"""
-        
         if len(self.df) < 50:
             st.info("Insufficient data points for seasonal analysis (need ≥50 observations)")
             return
         
         try:
-            # Create time index
             if self._has_date_column():
                 date_col = self.date_cols[0]
                 self.df = self.df.sort_values(date_col)
@@ -611,14 +624,10 @@ class AdvancedStatisticalAnalysis:
                 ts_data = pd.Series(self.df[variable].values, 
                                   index=pd.date_range(start='2020-01-01', periods=len(self.df), freq='D'))
             
-            # Calculate seasonal period
             seasonal_period = min(12, len(ts_data) // 4)
-            
-            # Seasonal decomposition
             decomposition = seasonal_decompose(ts_data.dropna(), period=seasonal_period, 
                                              extrapolate_trend='freq')
             
-            # Plot decomposition
             fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 12))
             
             decomposition.observed.plot(ax=ax1, title='Original')
@@ -629,11 +638,7 @@ class AdvancedStatisticalAnalysis:
             plt.tight_layout()
             st.pyplot(fig)
             
-            # Seasonal strength calculation
             seasonal_strength = max(0, 1 - (decomposition.resid.var() / decomposition.observed.var()))
-            
-            # Fixed string formatting
-            seasonal_period_str = seasonal_period
             seasonal_strength_desc = 'Strong' if seasonal_strength > 0.6 else 'Moderate' if seasonal_strength > 0.3 else 'Weak'
             trend_clarity = 'Clear' if decomposition.trend.std() > decomposition.observed.std() * 0.1 else 'Subtle'
             residual_pattern = 'Random' if abs(decomposition.resid.skew()) < 1 else 'Systematic'
@@ -645,7 +650,7 @@ class AdvancedStatisticalAnalysis:
                 <li><strong>Seasonal Strength:</strong> {seasonal_strength:.3f} ({seasonal_strength_desc})</li>
                 <li><strong>Trend Clarity:</strong> {trend_clarity}</li>
                 <li><strong>Residual Pattern:</strong> {residual_pattern}</li>
-                <li><strong>Seasonal Period:</strong> {seasonal_period_str} time points</li>
+                <li><strong>Seasonal Period:</strong> {seasonal_period} time points</li>
             </ul>
             </div>
             """, unsafe_allow_html=True)
@@ -654,18 +659,14 @@ class AdvancedStatisticalAnalysis:
             st.warning(f"Seasonal decomposition failed: {e}")
 
     def _change_point_analysis(self, variable):
-        """Simple change point detection"""
-        
         data = self.df[variable].dropna().values
         if len(data) < 20:
             return
         
-        # Simple change point detection using rolling statistics
         window = len(data) // 10
         rolling_mean = pd.Series(data).rolling(window=window, center=True).mean()
         rolling_std = pd.Series(data).rolling(window=window, center=True).std()
         
-        # Detect significant changes in mean
         z_scores = np.abs((data - rolling_mean) / rolling_std)
         change_points = np.where(z_scores > 2)[0]
         
@@ -682,7 +683,6 @@ class AdvancedStatisticalAnalysis:
             st.info(f"**Detected {len(change_points)} potential change points in {variable}**")
 
     def _prophet_forecasting(self, variable):
-        """Prophet time series forecasting"""
         if not PROPHET_AVAILABLE:
             return
             
@@ -690,12 +690,10 @@ class AdvancedStatisticalAnalysis:
         
         if st.button("Run Prophet Forecast"):
             try:
-                # Prepare data for Prophet
                 date_col = self.date_cols[0]
                 prophet_df = self.df[[date_col, variable]].dropna().copy()
                 prophet_df.columns = ['ds', 'y']
                 
-                # Initialize and fit Prophet model
                 model = Prophet(
                     yearly_seasonality=True,
                     weekly_seasonality=True,
@@ -704,20 +702,16 @@ class AdvancedStatisticalAnalysis:
                 )
                 model.fit(prophet_df)
                 
-                # Make future dataframe
                 future = model.make_future_dataframe(periods=30)
                 forecast = model.predict(future)
                 
-                # Plot forecast
                 fig1 = model.plot(forecast)
                 plt.title(f'Prophet Forecast for {variable}')
                 st.pyplot(fig1)
                 
-                # Plot components
                 fig2 = model.plot_components(forecast)
                 st.pyplot(fig2)
                 
-                # Display forecast metrics
                 st.write("**Forecast Summary (Next 30 periods):**")
                 last_forecast = forecast.tail(30)
                 col1, col2, col3 = st.columns(3)
@@ -734,37 +728,46 @@ class AdvancedStatisticalAnalysis:
                 st.error(f"Prophet forecasting failed: {e}")
 
     def _correlation_with_ci(self):
-        """Correlation analysis with confidence intervals"""
-        
         if len(self.numerical_cols) < 2:
             st.info("Need at least 2 numerical variables for correlation analysis")
             return
         
-        # Calculate correlations with p-values and confidence intervals
-        corr_matrix = np.zeros((len(self.numerical_cols), len(self.numerical_cols)))
-        p_value_matrix = np.zeros_like(corr_matrix)
-        ci_lower_matrix = np.zeros_like(corr_matrix)
-        ci_upper_matrix = np.zeros_like(corr_matrix)
+        # Create correlation heatmap
+        st.write("**Correlation Heatmap**")
+        corr_matrix = self.df[self.numerical_cols].corr()
+        
+        fig, ax = plt.subplots(figsize=(12, 10))
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, ax=ax,
+                   square=True, fmt='.2f', cbar_kws={'shrink': 0.8})
+        ax.set_title('Correlation Matrix Heatmap')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        st.pyplot(fig)
+        
+        # Interactive Plotly heatmap with confidence intervals
+        st.write("**Interactive Correlation Matrix with Confidence Intervals**")
+        
+        corr_matrix_plotly = np.zeros((len(self.numerical_cols), len(self.numerical_cols)))
+        p_value_matrix = np.zeros_like(corr_matrix_plotly)
+        ci_lower_matrix = np.zeros_like(corr_matrix_plotly)
+        ci_upper_matrix = np.zeros_like(corr_matrix_plotly)
         
         confidence_level = 0.95
         
         for i, col1 in enumerate(self.numerical_cols):
             for j, col2 in enumerate(self.numerical_cols):
                 if i == j:
-                    corr_matrix[i, j] = 1.0
+                    corr_matrix_plotly[i, j] = 1.0
                     continue
                 
-                # Remove pairs with missing values
                 valid_data = self.df[[col1, col2]].dropna()
                 if len(valid_data) < 3:
                     continue
                 
-                # Calculate correlation and confidence interval
                 corr, p_value = stats.pearsonr(valid_data[col1], valid_data[col2])
-                corr_matrix[i, j] = corr
+                corr_matrix_plotly[i, j] = corr
                 p_value_matrix[i, j] = p_value
                 
-                # Fisher transformation for CI
                 z = np.arctanh(corr)
                 se = 1 / np.sqrt(len(valid_data) - 3)
                 z_crit = stats.norm.ppf(1 - (1 - confidence_level) / 2)
@@ -774,9 +777,8 @@ class AdvancedStatisticalAnalysis:
                 ci_lower_matrix[i, j] = ci_lower
                 ci_upper_matrix[i, j] = ci_upper
         
-        # Create interactive correlation matrix with confidence intervals
         fig = go.Figure(data=go.Heatmap(
-            z=corr_matrix,
+            z=corr_matrix_plotly,
             x=self.numerical_cols,
             y=self.numerical_cols,
             colorscale='RdBu_r',
@@ -802,7 +804,7 @@ class AdvancedStatisticalAnalysis:
                     significant_corrs.append({
                         'Variable 1': col1,
                         'Variable 2': col2,
-                        'Correlation': corr_matrix[i, j],
+                        'Correlation': corr_matrix_plotly[i, j],
                         'P-value': p_value_matrix[i, j],
                         'CI Lower': ci_lower_matrix[i, j],
                         'CI Upper': ci_upper_matrix[i, j]
@@ -814,8 +816,6 @@ class AdvancedStatisticalAnalysis:
             st.dataframe(sig_corr_df.sort_values('Correlation', key=abs, ascending=False))
 
     def _distribution_analysis(self):
-        """Distribution analysis with confidence intervals for means"""
-        
         if not self.numerical_cols:
             return
         
@@ -825,12 +825,10 @@ class AdvancedStatisticalAnalysis:
         
         data = self.df[selected_var].dropna()
         
-        # Calculate statistics with confidence intervals
         mean = np.mean(data)
         std = np.std(data, ddof=1)
         n = len(data)
         
-        # Confidence interval for mean
         if n > 1:
             se = std / np.sqrt(n)
             t_critical = stats.t.ppf((1 + confidence_level) / 2, n - 1)
@@ -839,10 +837,8 @@ class AdvancedStatisticalAnalysis:
         else:
             ci_lower = ci_upper = mean
         
-        # Create distribution plot with confidence interval
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
         
-        # Histogram with confidence interval
         sns.histplot(data, kde=True, ax=ax1)
         ax1.axvline(mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean:.2f}')
         ax1.axvline(ci_lower, color='orange', linestyle=':', linewidth=2, 
@@ -853,14 +849,12 @@ class AdvancedStatisticalAnalysis:
         ax1.set_title(f'Distribution of {selected_var} with {confidence_level:.0%} CI')
         ax1.legend()
         
-        # Box plot
         sns.boxplot(y=data, ax=ax2)
         ax2.set_title(f'Box Plot of {selected_var}')
         
         plt.tight_layout()
         st.pyplot(fig)
         
-        # Display statistics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Mean", f"{mean:.2f}")
@@ -872,29 +866,24 @@ class AdvancedStatisticalAnalysis:
             st.metric(f"CI Upper ({confidence_level:.0%})", f"{ci_upper:.2f}")
 
     def _multivariate_analysis(self):
-        """Multivariate analysis using PCA"""
         if len(self.numerical_cols) < 2:
             st.info("Need at least 2 numerical variables for multivariate analysis")
             return
         
         st.subheader("Principal Component Analysis (PCA)")
         
-        # Prepare data for PCA
         X = self.df[self.numerical_cols].dropna()
         X_scaled = StandardScaler().fit_transform(X)
         
-        # Perform PCA
         pca = PCA()
         principal_components = pca.fit_transform(X_scaled)
         
-        # Explained variance
         exp_variance = pca.explained_variance_ratio_
         cum_variance = np.cumsum(exp_variance)
         
         col1, col2 = st.columns(2)
         
         with col1:
-            # Scree plot
             fig, ax = plt.subplots(figsize=(10, 6))
             components = range(1, len(exp_variance) + 1)
             ax.bar(components, exp_variance, alpha=0.6, color='skyblue', label='Individual')
@@ -906,7 +895,6 @@ class AdvancedStatisticalAnalysis:
             st.pyplot(fig)
         
         with col2:
-            # PCA loadings
             loadings = pd.DataFrame(
                 pca.components_.T,
                 columns=[f'PC{i+1}' for i in range(len(exp_variance))],
@@ -915,12 +903,10 @@ class AdvancedStatisticalAnalysis:
             st.write("**PCA Loadings (First 5 Components):**")
             st.dataframe(loadings.iloc[:, :5].round(3))
         
-        # Interpretation
         n_components_95 = np.argmax(cum_variance >= 0.95) + 1
         st.info(f"**Components needed for 95% variance: {n_components_95}**")
 
     def _advanced_statistical_tests(self):
-        """Advanced statistical tests using Pingouin"""
         if not PINGOUIN_AVAILABLE:
             return
             
@@ -928,8 +914,8 @@ class AdvancedStatisticalAnalysis:
         
         test_type = st.selectbox(
             "Select Statistical Test:",
-            ["ANOVA", "Repeated Measures ANOVA", "Mixed ANOVA", "Bayesian T-test", 
-             "Mann-Whitney U", "Kruskal-Wallis", "Chi-squared Test", "Partial Correlation"]
+            ["ANOVA", "Repeated Measures ANOVA", "Bayesian T-test", 
+             "Mann-Whitney U", "Partial Correlation"]
         )
         
         if test_type == "ANOVA":
@@ -944,7 +930,6 @@ class AdvancedStatisticalAnalysis:
             self._pingouin_partial_corr()
 
     def _pingouin_anova(self):
-        """One-way ANOVA using Pingouin"""
         st.write("**One-Way ANOVA**")
         
         dv = st.selectbox("Dependent Variable:", self.numerical_cols, key="anova_dv")
@@ -952,13 +937,10 @@ class AdvancedStatisticalAnalysis:
         
         if dv and between:
             try:
-                # Perform ANOVA
                 anova_result = pg.anova(data=self.df, dv=dv, between=between, detailed=True)
-                
                 st.write("**ANOVA Results:**")
                 st.dataframe(anova_result.round(4))
                 
-                # Interpretation
                 p_value = anova_result['p-unc'].iloc[0]
                 if p_value < 0.05:
                     st.markdown(f'<div class="significant">✅ Significant effect found (p = {p_value:.4f})</div>', 
@@ -967,7 +949,6 @@ class AdvancedStatisticalAnalysis:
                     st.markdown(f'<div class="not-significant">❌ No significant effect (p = {p_value:.4f})</div>', 
                                unsafe_allow_html=True)
                     
-                # Post-hoc tests if significant
                 if p_value < 0.05 and len(self.df[between].unique()) > 2:
                     st.write("**Post-hoc Tests (Tukey HSD):**")
                     posthoc = pg.pairwise_tukey(data=self.df, dv=dv, between=between)
@@ -977,7 +958,6 @@ class AdvancedStatisticalAnalysis:
                 st.error(f"ANOVA failed: {e}")
 
     def _pingouin_rm_anova(self):
-        """Repeated Measures ANOVA using Pingouin"""
         st.write("**Repeated Measures ANOVA**")
         st.info("For repeated measures, ensure you have within-subjects factor")
         
@@ -987,17 +967,13 @@ class AdvancedStatisticalAnalysis:
         
         if dv and within and subject:
             try:
-                # Perform repeated measures ANOVA
                 rm_anova = pg.rm_anova(data=self.df, dv=dv, within=within, subject=subject, detailed=True)
-                
                 st.write("**Repeated Measures ANOVA Results:**")
                 st.dataframe(rm_anova.round(4))
-                
             except Exception as e:
                 st.error(f"Repeated Measures ANOVA failed: {e}")
 
     def _pingouin_bayesian_ttest(self):
-        """Bayesian T-test using Pingouin"""
         st.write("**Bayesian T-test**")
         
         variable = st.selectbox("Variable:", self.numerical_cols, key="bayes_var")
@@ -1010,13 +986,10 @@ class AdvancedStatisticalAnalysis:
                 group2 = self.df[self.df[group_var] == groups[1]][variable]
                 
                 try:
-                    # Perform Bayesian t-test
                     bayes_ttest = pg.ttest(group1, group2, paired=False, alternative='two-sided')
-                    
                     st.write("**Bayesian T-test Results:**")
                     st.dataframe(bayes_ttest.round(4))
                     
-                    # Interpretation based on BF10
                     bf10 = bayes_ttest['BF10'].iloc[0]
                     if bf10 > 3:
                         st.markdown(f'<div class="significant">✅ Substantial evidence for H1 (BF10 = {bf10:.2f})</div>', 
@@ -1032,7 +1005,6 @@ class AdvancedStatisticalAnalysis:
                     st.error(f"Bayesian t-test failed: {e}")
 
     def _pingouin_mannwhitney(self):
-        """Mann-Whitney U test using Pingouin"""
         st.write("**Mann-Whitney U Test (Non-parametric)**")
         
         variable = st.selectbox("Variable:", self.numerical_cols, key="mw_var")
@@ -1045,17 +1017,13 @@ class AdvancedStatisticalAnalysis:
                 group2 = self.df[self.df[group_var] == groups[1]][variable]
                 
                 try:
-                    # Perform Mann-Whitney test
                     mw_test = pg.mwu(group1, group2, alternative='two-sided')
-                    
                     st.write("**Mann-Whitney U Test Results:**")
                     st.dataframe(mw_test.round(4))
-                    
                 except Exception as e:
                     st.error(f"Mann-Whitney test failed: {e}")
 
     def _pingouin_partial_corr(self):
-        """Partial correlation using Pingouin"""
         st.write("**Partial Correlation**")
         
         var1 = st.selectbox("Variable 1:", self.numerical_cols, key="pcorr_var1")
@@ -1066,7 +1034,6 @@ class AdvancedStatisticalAnalysis:
         
         if var1 and var2:
             try:
-                # Perform partial correlation
                 if covar:
                     pcorr = pg.partial_corr(data=self.df, x=var1, y=var2, covar=covar)
                 else:
@@ -1074,12 +1041,10 @@ class AdvancedStatisticalAnalysis:
                 
                 st.write("**Partial Correlation Results:**")
                 st.dataframe(pcorr.round(4))
-                
             except Exception as e:
                 st.error(f"Partial correlation failed: {e}")
 
     def _time_series_analysis(self):
-        """Time series specific analysis"""
         if not self._has_date_column():
             st.info("No date column found for time series analysis")
             return
@@ -1087,14 +1052,11 @@ class AdvancedStatisticalAnalysis:
         date_col = self.date_cols[0]
         numerical_var = st.selectbox("Select numerical variable for time series:", self.numerical_cols)
         
-        # Ensure data is sorted by date
         self.df = self.df.sort_values(date_col)
         
-        # Stationarity test
         st.subheader("Stationarity Analysis")
         data = self.df[numerical_var].dropna()
         
-        # Augmented Dickey-Fuller test
         adf_result = adfuller(data)
         
         col1, col2, col3 = st.columns(3)
@@ -1107,11 +1069,9 @@ class AdvancedStatisticalAnalysis:
             st.metric("Stationary", is_stationary)
 
     def _has_date_column(self):
-        """Check if dataframe has date columns"""
         return len(self.date_cols) > 0
     
     def _get_trend_direction(self, series):
-        """Determine trend direction from series"""
         if len(series.dropna()) < 2:
             return "Insufficient data"
         
@@ -1130,7 +1090,6 @@ class AdvancedStatisticalAnalysis:
             return "Relatively Stable"
     
     def _get_volatility_pattern(self, std_series):
-        """Analyze volatility pattern"""
         if len(std_series.dropna()) < 2:
             return "Insufficient data"
         
@@ -1142,27 +1101,320 @@ class AdvancedStatisticalAnalysis:
         else:
             return "Stable"
 
-    # Phase 3: Model Evaluation
+    # Phase 3: Model Evaluation & Validation (COMPLETE IMPLEMENTATION)
     def model_evaluation_phase(self):
         st.markdown('<div class="phase-header"><h2>🤖 Phase 3: Model Evaluation & Validation</h2></div>', 
                    unsafe_allow_html=True)
         
-        problem_type = st.radio("Select Problem Type:", 
-                               ["Classification", "Regression"])
+        st.subheader("Model Configuration")
         
-        target_var = st.selectbox("Select Target Variable:", self.df.columns)
+        # Problem type selection
+        problem_type = st.radio(
+            "Select Problem Type:", 
+            ["Classification", "Regression"],
+            horizontal=True
+        )
         
-        if st.button("Run Model Evaluation"):
-            if problem_type == "Classification":
-                self._classification_evaluation(target_var)
+        # Target variable selection with dynamic options
+        if problem_type == "Classification":
+            target_options = [col for col in self.df.columns if self.df[col].nunique() <= 10 or self.df[col].dtype == 'object']
+        else:
+            target_options = self.numerical_cols
+        
+        if not target_options:
+            st.error("No suitable target variables found for the selected problem type.")
+            return
+            
+        target_var = st.selectbox("Select Target Variable:", target_options)
+        
+        if not target_var:
+            st.warning("Please select a target variable.")
+            return
+        
+        # Preprocess data
+        preprocessor = DataPreprocessor()
+        df_processed = preprocessor.preprocess_data(self.df, target_var)
+        
+        # Model selection
+        if problem_type == "Classification":
+            model_choice = st.selectbox(
+                "Select Model:",
+                ["Random Forest", "Logistic Regression", "Support Vector Machine"]
+            )
+        else:
+            model_choice = st.selectbox(
+                "Select Model:",
+                ["Random Forest", "Linear Regression", "Support Vector Regression"]
+            )
+        
+        # Cross-validation settings
+        cv_folds = st.slider("Cross-validation folds:", 3, 10, 5)
+        
+        if st.button("Train and Evaluate Model", type="primary"):
+            with st.spinner("Training model..."):
+                try:
+                    # Prepare features
+                    X, y = preprocessor.prepare_features(df_processed, target_var, problem_type)
+                    
+                    if X.empty:
+                        st.error("No valid features available for modeling.")
+                        return
+                    
+                    # Train-test split
+                    test_size = st.slider("Test set size:", 0.1, 0.4, 0.2)
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y, test_size=test_size, random_state=42, 
+                        stratify=y if problem_type == "Classification" else None
+                    )
+                    
+                    # Train and evaluate model
+                    if problem_type == "Classification":
+                        results = self._evaluate_classification_model(
+                            model_choice, X_train, X_test, y_train, y_test, cv_folds
+                        )
+                    else:
+                        results = self._evaluate_regression_model(
+                            model_choice, X_train, X_test, y_train, y_test, cv_folds
+                        )
+                    
+                    # Display results
+                    self._display_model_results(results, problem_type, X_test, y_test)
+                    
+                except Exception as e:
+                    st.error(f"Model training failed: {str(e)}")
+
+    def _evaluate_classification_model(self, model_choice, X_train, X_test, y_train, y_test, cv_folds):
+        """Evaluate classification models"""
+        if model_choice == "Random Forest":
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+        elif model_choice == "Logistic Regression":
+            model = LogisticRegression(random_state=42, max_iter=1000)
+        elif model_choice == "Support Vector Machine":
+            model = SVC(random_state=42, probability=True)
+        else:
+            model = RandomForestClassifier(random_state=42)
+        
+        # Train model
+        model.fit(X_train, y_train)
+        
+        # Predictions
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test) if hasattr(model, "predict_proba") else None
+        
+        # Cross-validation
+        cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds, scoring='accuracy')
+        
+        # Metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        
+        return {
+            'model': model,
+            'model_name': model_choice,
+            'y_test': y_test,
+            'y_pred': y_pred,
+            'y_pred_proba': y_pred_proba,
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'cv_scores': cv_scores,
+            'cv_mean': cv_scores.mean(),
+            'cv_std': cv_scores.std(),
+            'feature_names': X_train.columns.tolist()
+        }
+
+    def _evaluate_regression_model(self, model_choice, X_train, X_test, y_train, y_test, cv_folds):
+        """Evaluate regression models"""
+        if model_choice == "Random Forest":
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+        elif model_choice == "Linear Regression":
+            model = LinearRegression()
+        elif model_choice == "Support Vector Regression":
+            model = SVR()
+        else:
+            model = RandomForestRegressor(random_state=42)
+        
+        # Train model
+        model.fit(X_train, y_train)
+        
+        # Predictions
+        y_pred = model.predict(X_test)
+        
+        # Cross-validation
+        cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds, scoring='r2')
+        
+        # Metrics
+        mae = mean_absolute_error(y_test, y_pred)
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_test, y_pred)
+        mape = mean_absolute_percentage_error(y_test, y_pred)
+        
+        return {
+            'model': model,
+            'model_name': model_choice,
+            'y_test': y_test,
+            'y_pred': y_pred,
+            'mae': mae,
+            'mse': mse,
+            'rmse': rmse,
+            'r2': r2,
+            'mape': mape,
+            'cv_scores': cv_scores,
+            'cv_mean': cv_scores.mean(),
+            'cv_std': cv_scores.std(),
+            'feature_names': X_train.columns.tolist()
+        }
+
+    def _display_model_results(self, results, problem_type, X_test, y_test):
+        """Display model evaluation results"""
+        st.subheader("📊 Model Performance Results")
+        
+        # Performance metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        if problem_type == "Classification":
+            with col1:
+                st.metric("Accuracy", f"{results['accuracy']:.3f}")
+            with col2:
+                st.metric("Precision", f"{results['precision']:.3f}")
+            with col3:
+                st.metric("Recall", f"{results['recall']:.3f}")
+            with col4:
+                st.metric("F1-Score", f"{results['f1']:.3f}")
+        else:
+            with col1:
+                st.metric("R² Score", f"{results['r2']:.3f}")
+            with col2:
+                st.metric("RMSE", f"{results['rmse']:.3f}")
+            with col3:
+                st.metric("MAE", f"{results['mae']:.3f}")
+            with col4:
+                st.metric("MAPE", f"{results['mape']:.1f}%")
+        
+        # Cross-validation results
+        st.write("**Cross-Validation Results:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"Mean CV Score: {results['cv_mean']:.3f} (±{results['cv_std']:.3f})")
+        with col2:
+            for i, score in enumerate(results['cv_scores']):
+                st.write(f"Fold {i+1}: {score:.3f}")
+        
+        # Visualizations
+        if problem_type == "Classification":
+            self._plot_classification_results(results, X_test, y_test)
+        else:
+            self._plot_regression_results(results)
+        
+        # Feature importance
+        self._plot_feature_importance(results)
+        
+        # Model interpretation
+        st.markdown(f"""
+        <div class="model-box">
+        <h4>🎯 Model Interpretation - {results['model_name']}:</h4>
+        <ul>
+            <li><strong>Model Performance:</strong> {'Excellent' if results['cv_mean'] > 0.8 else 'Good' if results['cv_mean'] > 0.6 else 'Fair' if results['cv_mean'] > 0.4 else 'Poor'}</li>
+            <li><strong>Generalization:</strong> {'Good' if results['cv_std'] < 0.1 else 'Moderate' if results['cv_std'] < 0.15 else 'Poor'} (CV std: {results['cv_std']:.3f})</li>
+            <li><strong>Recommendation:</strong> {'Ready for deployment' if results['cv_mean'] > 0.7 and results['cv_std'] < 0.1 else 'Needs improvement'}</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    def _plot_classification_results(self, results, X_test, y_test):
+        """Plot classification results"""
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Confusion Matrix
+            cm = confusion_matrix(results['y_test'], results['y_pred'])
+            fig, ax = plt.subplots(figsize=(8, 6))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+            ax.set_xlabel('Predicted')
+            ax.set_ylabel('Actual')
+            ax.set_title('Confusion Matrix')
+            st.pyplot(fig)
+        
+        with col2:
+            # ROC Curve (for binary classification)
+            if results['y_pred_proba'] is not None and len(np.unique(results['y_test'])) == 2:
+                fpr, tpr, _ = roc_curve(results['y_test'], results['y_pred_proba'][:, 1])
+                roc_auc = auc(fpr, tpr)
+                
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+                ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                ax.set_xlim([0.0, 1.0])
+                ax.set_ylim([0.0, 1.05])
+                ax.set_xlabel('False Positive Rate')
+                ax.set_ylabel('True Positive Rate')
+                ax.set_title('ROC Curve')
+                ax.legend(loc="lower right")
+                st.pyplot(fig)
+
+    def _plot_regression_results(self, results):
+        """Plot regression results"""
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Actual vs Predicted
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.scatter(results['y_test'], results['y_pred'], alpha=0.6)
+            ax.plot([results['y_test'].min(), results['y_test'].max()], 
+                   [results['y_test'].min(), results['y_test'].max()], 'r--', lw=2)
+            ax.set_xlabel('Actual Values')
+            ax.set_ylabel('Predicted Values')
+            ax.set_title('Actual vs Predicted Values')
+            st.pyplot(fig)
+        
+        with col2:
+            # Residuals plot
+            residuals = results['y_test'] - results['y_pred']
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.scatter(results['y_pred'], residuals, alpha=0.6)
+            ax.axhline(y=0, color='r', linestyle='--')
+            ax.set_xlabel('Predicted Values')
+            ax.set_ylabel('Residuals')
+            ax.set_title('Residual Plot')
+            st.pyplot(fig)
+
+    def _plot_feature_importance(self, results):
+        """Plot feature importance"""
+        st.subheader("🔍 Feature Importance")
+        
+        try:
+            if hasattr(results['model'], 'feature_importances_'):
+                # Get feature importances
+                importances = results['model'].feature_importances_
+                feature_names = results['feature_names']
+                
+                # Create feature importance DataFrame
+                fi_df = pd.DataFrame({
+                    'feature': feature_names,
+                    'importance': importances
+                }).sort_values('importance', ascending=True)
+                
+                # Plot
+                fig, ax = plt.subplots(figsize=(10, 8))
+                ax.barh(fi_df['feature'], fi_df['importance'])
+                ax.set_xlabel('Feature Importance')
+                ax.set_title('Feature Importance Plot')
+                plt.tight_layout()
+                st.pyplot(fig)
+                
+                # Display table
+                st.write("**Feature Importance Scores:**")
+                st.dataframe(fi_df.sort_values('importance', ascending=False).head(10))
+                
             else:
-                self._regression_evaluation(target_var)
-    
-    def _classification_evaluation(self, target_var):
-        st.info("Classification evaluation would be implemented here")
-    
-    def _regression_evaluation(self, target_var):
-        st.info("Regression evaluation would be implemented here")
+                st.info("Feature importance not available for this model type.")
+                
+        except Exception as e:
+            st.warning(f"Could not compute feature importance: {str(e)}")
 
 def main():
     st.markdown('<div class="main-header">📊 Advanced Statistical Analysis Suite</div>', 
@@ -1173,11 +1425,10 @@ def main():
     trend analysis, and confidence interval estimation for robust data insights.
     """)
     
-    # Enhanced Data Upload Section
+    # Data source selection
     st.markdown('<div class="upload-section"><h3>📁 Data Source Selection</h3></div>', 
                 unsafe_allow_html=True)
     
-    # Data source selection
     data_source = st.radio(
         "Choose your data source:",
         ["Upload File", "URL", "Sample Data"],
@@ -1237,14 +1488,6 @@ def main():
     
     # Proceed with analysis if data is loaded
     if df is not None:
-        # Auto-detect date columns
-        for col in df.columns:
-            if 'date' in col.lower() or 'time' in col.lower():
-                try:
-                    df[col] = pd.to_datetime(df[col])
-                except:
-                    pass
-        
         # Initialize analysis class
         analysis = AdvancedStatisticalAnalysis(df)
         
@@ -1253,7 +1496,7 @@ def main():
         phases = st.sidebar.multiselect(
             "Select analysis phases to run:",
             ["Data Validation", "Exploratory Analysis", "Model Evaluation"],
-            default=["Data Validation", "Exploratory Analysis"]
+            default=["Data Validation", "Exploratory Analysis", "Model Evaluation"]
         )
         
         # Data export options
