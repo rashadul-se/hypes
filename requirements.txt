@@ -1,0 +1,39 @@
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+seaborn>=0.12.0
+matplotlib>=3.7.0
+plotly>=5.15.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+statsmodels>=0.14.0
+requests>=2.31.0
+openpyxl>=3.1.0
+fpdf>=1.7.2
+joblib>=1.3.0
+threadpoolctl>=3.2.0
+# For additional statistical tests
+pingouin>=0.5.0
+
+# For advanced time series analysis
+prophet>=1.1.0
+
+# For database connectivity
+#sqlalchemy>=2.0.0
+#sqlite3
+
+# For PDF reporting with tables
+reportlab>=4.0.0
+
+# For interactive widgets
+#streamlit-aggrid>=0.3.0
+
+# For authentication
+#streamlit-authenticator>=0.2.0
+
+# For caching and performance
+cachetools>=5.3.0
+
+# For date handling
+#python-dateutil>=2.8.0
+#pytz>=2023.0
